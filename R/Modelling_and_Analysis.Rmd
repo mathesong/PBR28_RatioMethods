@@ -1,0 +1,733 @@
+---
+title: '[11C]PBR-28 Test-Retest Analysis: Ratio-Based Methods Evaluation'
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+  md_document:
+    toc: yes
+    toc_depth: 3
+    variant: markdown_github
+---
+
+```{r opts, echo = FALSE}
+knitr::opts_chunk$set(
+  fig.path = "images/"
+)
+```
+
+# Aims
+
+The aims of this study were to evaluate the test-retest reliability, and validity (assessed by the relationship to V~T~) of the Standardised Uptake Value Ratio (SUVR) and Distribution Volume Ratio (DVR) of [11C]PBR28 in the frontal cortex (FC), using the whole brain (WB) and cerebellum (CBL) as reference regions (i.e. denominators).  We also aim to examine the degree of association of binding estimates between regions of the brain.
+
+# Libraries
+
+## CRAN libraries
+
+First, the libraries for the analysis and plotting are loaded.
+
+```{r cran_packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(stringr)
+library(corrplot)
+library(grid)
+library(gridExtra)
+library(RColorBrewer)
+library(psych)
+library(readxl)
+library(pracma)
+```
+
+## Non-CRAN libraries
+
+The libraries above can be installed from CRAN.  Those which cannot are installed as follows:
+
+```{r github_packages}
+# install.packages("devtools")  # If you do not already have devtools
+# devtools::install_github("mathesong/kinfitr", ref="v0.2.0")
+# devtools::install_github("mathesong/granviller")
+# devtools::install_github("mvuorre/vmisc")
+# devtools::install_github('Rapporter/pander')
+
+library(kinfitr)
+library(vmisc)
+library(pander)
+```
+
+
+# Demographic Data
+
+Here, the demographic data is loaded in.
+
+```{r demographics}
+demog <- read_excel('../RawData/TrT_chemistry_demograph.xlsx') %>%
+  select(Subjname=Akronym, Gender=Sex, Age, Genotype, 
+         PET_same_day, `MBq PET1`, `MBq PET2`, bodyMass=Weight_kg) %>%
+  gather(PETNo, injRad, contains('MBq')) %>%
+  mutate(PETNo = as.numeric(str_match(PETNo, '\\d'))) %>%
+  mutate(PET = paste(Subjname, PETNo, sep='_'))
+```
+
+
+
+## Summary Statistics
+
+Below are presented some summary statistics of the demographic data.
+
+```{r sumstats, results="asis"}
+demog %>%
+  select(Age, InjectedRadioactivity = injRad) %>%
+  describe() %>%
+  pandoc.table(digits=3, caption = "Summary Statistics", split.tables=Inf)
+```
+
+```{r gender_genotype, results="asis"}
+counts <- demog %>%
+  filter(PETNo==1)
+
+pandoc.table(table(counts$Gender, counts$Genotype), caption = "Gender and Genotype")
+```
+
+
+
+
+
+# TACs and Blood Data
+
+First, we must read in the TAC and blood data.  It should be noted that the blood data is already dispersion corrected, and the plasma data is already metabolite corrected, thus the plasma fraction is set to 100% in the input data frame.  It should also be noted that we set all negative values of both blood and plasma radioactivity concentrations to zero.
+
+
+```{r readdat, message=F}
+tacdat <- read_csv('../RawData/tacdata.csv') %>%
+  group_by(PET) %>%
+  nest(.key = 'tacs')
+
+blooddat <- read_csv('../RawData/blooddata.csv') %>%
+  mutate(Cbl.disp.corr = ifelse(Cbl.disp.corr < 0, 0, Cbl.disp.corr),
+         Cpl..metabcorr. = ifelse(Cpl..metabcorr. < 0, 0, Cpl..metabcorr.)) %>%
+  group_by(PET) %>%
+  nest(.key='blooddata') %>%
+  mutate(input = map(blooddata, ~blood_interp(
+             t_blood = .x$ABSS.sec/60, blood=.x$Cbl.disp.corr, 
+             t_plasma=.x$ABSS.sec/60, plasma=.x$Cpl..metabcorr., 
+             t_parentfrac = 1, parentfrac=1 ) ))
+
+dat <- inner_join(tacdat, blooddat) %>%
+  separate(PET, c("Subjname", "PETNo"), sep='_', remove = F, convert=T)
+```
+
+
+
+Here, the TACs and blood data are merged with the demographic data.  
+```{r demogdat, message=F}
+datdf <- dat %>%
+  inner_join(demog) %>%
+  arrange(PET)
+```
+
+
+
+# Kinetic Modelling
+
+Kinetic modelling is performed using the [kinfitr](https://github.com/mathesong/kinfitr) R package. 
+
+
+## Fitting of the Delay and Blood Volume Fraction
+
+Here, the delay and blood bolume fraction are fitted using the whole brain ROI using 2TCM.
+
+```{r fit_delay_vb}
+datdf <- datdf %>%
+  group_by(PET) %>%
+  mutate(WB_delay = map2(tacs, input, 
+                         ~twotcm(t_tac = .x$Times/60, tac = .x$WB, input = .y, 
+                                 frameStartEnd = c(1,33), inpshift.upper = 1))) %>%
+  ungroup()
+```
+
+
+
+## Rearrangement of the Data into Long Format
+
+Here, the data is transformed from wide format (where each row represents one PET measurement) into long format (where each row represents one region of each PET measurement)
+
+```{r short2long, message=F}
+tacs <- datdf %>%
+  select(PET, tacs, Subjname, PETNo) %>%
+  unnest() %>%
+  gather(Region, TAC, -(PET:Weights), -(StartTime:Duration)) %>%
+  group_by(PET, Subjname, PETNo, Region) %>%
+  nest() %>%
+  rename(tacs=data)
+  
+
+longdat <- datdf %>%
+  select(PET, Subjname, PETNo, input, WB_delay, bodyMass, injRad) %>%
+  inner_join(tacs)
+```
+
+
+## Define functions for fitting the models
+
+Here we define functions for fitting each of the models.
+
+```{r fit_functions}
+# Total SUV
+calcSUV <- function(tacs, bodymass, injRad) {
+  SUV(t_tac = tacs$Times/60, 
+         tac = tacs$TAC*0.037,    # To kBq - because of kg
+         injRad = injRad,
+         bodymass = bodymass,
+         frameStartEnd=c(1,33))
+}
+
+# 40-60 Minute SUV
+calcSUV_4060 <- function(SUVout) {
+  
+    interptime = seq(SUVout$tacs$Time[1], rev(SUVout$tacs$Time)[1], by=1/60)
+    interptac  = interp1(x = SUVout$tacs$Time, SUVout$tacs$SUV, 
+                                 xi = interptime, method = 'linear')
+    step=interptime[2] - interptime[1]
+    
+    SUVdf <- data.frame(interptime, interptac) %>%
+      filter(interptime > 40 & interptime <= 60)
+    
+    out <- mean(SUVdf$interptac)
+    return(out)
+}
+
+# MA1 using the fitted delay and vB from delayFit
+fitma1 <- function(tacs, input, delayFit) {
+  ma1(t_tac = tacs$Times/60, tac = tacs$TAC, input = input, tstarIncludedFrames = 6,
+      inpshift = delayFit$par$inpshift, frameStartEnd=c(1,33), weights=tacs$Weights,
+      vB=delayFit$par$vB)
+}
+
+# 2TCM using the fitted delay and vB from delayFit
+fit2tcm <- function(tacs, input, delayFit) {
+  twotcm(t_tac = tacs$Times/60, tac = tacs$TAC, input = input, 
+         inpshift = delayFit$par$inpshift, vB=delayFit$par$vB, 
+         frameStartEnd=c(1,33), weights=tacs$Weights)
+}
+```
+
+
+
+## Fit all Kinetic Models
+
+Here, all kinetic models are fitted, and the V~T~ values are extracted and added to the data frame.
+
+```{r do_fitting}
+longdat <- longdat %>%
+  # SUV Total
+  mutate(suvout_tot = pmap(list(tacs, bodyMass, injRad), calcSUV)) %>%
+  mutate(SUV_tot = map_dbl(suvout_tot, c('par', 'intSUV'))) %>%
+  
+  # SUV 40-60 Minutes
+  mutate(SUV_4060 = map_dbl(suvout_tot, calcSUV_4060)) %>%
+  
+  # MA1
+  mutate(fit_ma1 = pmap(list(tacs, input, WB_delay), fitma1)) %>%
+  mutate(Vt_ma1 = map_dbl(fit_ma1, c('par', 'Vt'))) %>%
+    
+  # 2TCM using fitted vB and delay
+  mutate(fit_2tcm= pmap(list(tacs, input, WB_delay), fit2tcm)) %>%
+  mutate(Vt_2tcm = map_dbl(fit_2tcm, c('par', 'Vt')))
+```
+
+
+
+# Calculate Ratio Outcomes
+
+Here we calculate the Ratio Outcomes for SUV~Total~, SUV~40-60~, 2TCM and MA1.
+
+```{r calc_ratios}
+trtdata <- longdat %>%
+  select(Subjname, PETNo, Region, SUV_tot, SUV_4060, Vt_ma1, Vt_2tcm) %>%
+  gather(Measure, Value, -Subjname, -PETNo, -Region) %>%
+  spread(Region, Value) %>%
+  mutate(FC_CBL = FC/CBL, FC_WB=FC/WB)
+```
+
+
+# Evaluate Spread and Test-Retest Metrics
+
+Here we evaluate the spread and test-retest performance for all measures.  Due to the influence of genotype, there are systematic differences between individuals.  There are high-affinity binders (HABs) and medium-affinity binders (MABs) in this analysis.  Thus, test-retest analyses are performed separately for HABs and MABs.  Ratio-based outcome measures should account for genotype.  Thus, we also performed test-retest analysis on all measurements together.
+
+Note that SEM, the standard error of measurement, can be presented as an estimated standard error around each estimate (i.e. in the same units as the outcome), or as a percentage of the mean outcome like an estimate of the within-individual coefficient of variation.  Here, due to differences in the scale of the outcome measures, it is presented as a percentage.  This is why it is transformed from the original output.
+
+
+## HABs and MABs together
+
+```{r trt_all, results="asis"}
+trtout <- trtdata %>%
+  gather(Region, Binding, -(Subjname:Measure)) %>%
+  filter(Subjname != 'uqis') %>%
+  spread(PETNo, Binding, drop = T) %>%
+  group_by(Region, Measure) %>%
+  do(trt = granviller::trt(.$`1`, .$`2`)$tidy) %>%
+  ungroup() %>%
+  unnest() %>%
+  select(-se, -skew, -kurtosis, -md, -avgpercchange) %>%
+  mutate('SEM %' = sem/mean*100,
+         'COV %' = cov*100) %>%
+  select(-sem, -cov) %>%
+  arrange(Measure, Region) %>%
+  add_column(Genotype='All', .after='Measure')
+
+pandoc.table(trtout, digits=2, split.tables=Inf, 
+             caption='Test-Retest Analysis for HABs and MABs together')
+```
+
+## Separated by Genotype
+
+```{r sep_genotype}
+trtdata$Genotype <- ifelse(trtdata$Subjname %in% demog$Subjname[demog$Genotype=='HAB'], 
+                           yes='HAB', no='MAB')
+
+trtout_genotypes <- trtdata %>%
+  gather(Region, Binding, -(Subjname:Measure), -Genotype) %>%
+  filter(Subjname != 'uqis') %>%
+  spread(PETNo, Binding) %>%
+  group_by(Region, Measure, Genotype) %>%
+  do(trt = granviller::trt(.$`1`, .$`2`)$tidy) %>%
+  ungroup() %>%
+  unnest() %>%
+  select(-se, -skew, -kurtosis, -md, -avgpercchange) %>%
+  mutate('SEM %' = sem/mean*100,
+         'COV %' = cov*100) %>%
+  select(-sem, -cov) %>%
+  arrange(Measure, Region)
+```
+
+### HABs
+
+```{r trt_hab, results="asis"}
+hab_trtout <- filter(trtout_genotypes, Genotype=='HAB')
+pandoc.table(hab_trtout, digits=2, split.tables=Inf, 
+             caption='Test-Retest Analysis for HABs')
+```
+
+### MABs
+
+```{r trt_mab, results="asis"}
+mab_trtout <- filter(trtout_genotypes, Genotype=='MAB')
+pandoc.table(mab_trtout, digits=2, split.tables=Inf, 
+             caption='Test-Retest Analysis for MABs')
+```
+
+## Article Summary
+
+```{r pretty_trt, results="asis", message=F}
+summary_trtout <- bind_rows(list(trtout, hab_trtout, mab_trtout)) %>%
+  arrange(rev(Measure), Region, Genotype) %>%
+  filter(Region %in% c("FC", "FC_WB", "FC_CBL")) %>%
+  filter(Measure %in% c("Vt_2tcm", "SUV_4060")) %>%
+  #separate(Region, c("Region", "Denominator"), sep = '_')
+  mutate(Denominator = str_match(Region, '_(.*)')[,2]) %>%
+  select(Measure, Genotype, Denominator=Denominator, Mean=mean, `COV %`, 
+         ICC=icc, VAR=aapd, `SEM %`) %>%
+  mutate(Measure = ifelse(Measure=='Vt_2tcm', 'V~T-2TCM~', 'SUV~40-60min~')) %>%
+  filter(!(Denominator=='-' & Genotype=='All')) %>%
+  replace_na(list(Denominator='-'))
+
+
+pandoc.table(summary_trtout, digits=2, split.tables=Inf, 
+             caption='Test-Retest Table for Article')
+```
+
+
+
+# Correlations with V~T~
+
+Here, the data is arranged for assessment of the correlation with V~T~
+
+```{r cor_arrange}
+plotdat <- trtdata %>%
+  select(-CBL, -(STR:WB)) %>%
+  filter(Measure != 'SUV_tot') %>%
+  gather(Region, Value, -(Subjname:Measure), -Genotype) %>%
+  #mutate(Region = str_replace(Region, 'FC', replacement = '')) %>%
+  unite(Outcome, Measure, Region) %>%
+  spread(Outcome, Value) %>%
+  mutate(PET = paste(Subjname, PETNo, sep='_')) %>%
+  filter(PET != 'uqis_2')
+```
+
+
+Here, correlations with 2TCM V~T~ are calculated.
+
+```{r calc_cor, results="asis"}
+corout <- plotdat %>%
+  gather(Measure, Binding, -PET, -(Subjname:Genotype), -Vt_2tcm_FC) %>%
+  group_by(Measure, Genotype) %>%
+  summarise('R^2^'=cor(Binding, Vt_2tcm_FC)^2) %>%
+  arrange(Measure, Genotype) %>%
+  ungroup() %>%
+  mutate(Measure = str_replace(string=Measure, pattern='_FC', replacement='')) %>%
+  mutate(Measure = str_replace(string=Measure, pattern='_4060', replacement='')) %>%
+  mutate(Measure = str_replace(string=Measure, pattern='_', replacement='~')) %>%
+  mutate(Measure = str_replace(string=Measure, pattern='CBL', replacement='CBL~')) %>%
+  mutate(Measure = str_replace(string=Measure, pattern='WB', replacement='WB~')) %>%
+  mutate(Measure = str_replace(string=Measure, pattern='Vt~2tcm_', replacement='DVR~')) %>%
+  filter(!str_detect(Measure, '~ma1_')) %>%
+  mutate(Measure = str_replace(string=Measure, pattern='Vt~ma1', replacement='V~T-MA1~'))
+
+pandoc.table(corout, digits=2, split.tables=Inf, caption="Correlations with V~T~")
+```
+
+
+## Plot of Ratio Associations with V~T~
+
+```{r vt_correlations, warning=F, message=F, fig.height=7, fig.width=10}
+longplotdat <- plotdat %>%
+  gather(Measure, Binding, -PET, -(Subjname:Genotype), -Vt_2tcm_FC) %>%
+  group_by(Measure) %>%
+  nest() %>%
+  mutate(outplot = map(data, 
+                        ~ggplot(.x, aes(x=Vt_2tcm_FC, y=Binding, colour=Genotype)) +
+                          geom_point() + theme_blog() + 
+                          geom_line(aes(group=Subjname), linetype="dotted") +
+                          theme(axis.title.y=element_blank(),
+                          plot.background = element_rect(fill = "white")) +
+                          scale_color_brewer(palette = 'Set1') + 
+                          geom_smooth(method="lm", se=F)))
+
+# SUVWB
+a <- longplotdat$outplot[[which(longplotdat$Measure=='SUV_4060_FC_WB')]] + 
+  expand_limits(x=0,y=c(0.95,1.1)) + 
+  labs(x=expression(V[T]),
+       y=expression(SUVR[WB])) +
+   theme(axis.title.x=element_blank())
+
+# SUVCBL
+b <- longplotdat$outplot[[which(longplotdat$Measure=='SUV_4060_FC_CBL')]] + 
+  expand_limits(x=0,y=c(0.8,1.1)) +
+  labs(x=expression(V[T]),
+       y=expression(SUVR[CBL]))  +
+   theme(axis.title.x=element_blank())
+
+# DVRWB
+c <- longplotdat$outplot[[which(longplotdat$Measure=='Vt_2tcm_FC_WB')]] + 
+  expand_limits(x=0,y=c(0.95,1.1)) + 
+  labs(x=expression(paste('Frontal Cortex ',V[T])),
+       y=expression(DVR[WB]))
+
+# DVRCBL
+d <- longplotdat$outplot[[which(longplotdat$Measure=='Vt_2tcm_FC_CBL')]] + 
+  expand_limits(x=0,y=c(0.8,1.1)) + 
+  labs(x=expression(paste('Frontal Cortex ',V[T])),
+       y=expression(DVR[CBL]))
+
+# Text Labels
+e = textGrob(label = 'SUVR')
+f = textGrob(label = 'DVR')
+g = textGrob(label = '     Whole Brain')
+h = textGrob(label = '     Cerebellum')
+
+# Legend
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  legend
+}
+
+a2 <- ggplot(plotdat, aes(x=Vt_2tcm_FC, y=SUV_4060_FC_WB, colour=Genotype)) + 
+  geom_point() + theme_bw() +
+  scale_color_brewer('Genotype', palette = 'Set1')
+
+genlegend <- g_legend(a2)
+
+layout <- rbind(c(NA, 7, 8, 9 ),
+                c(1, 2, 3, 9),
+                c(4, 5, 6, 9))
+
+grid.arrange(grobs=list(e,a,b,f,c,d,g,h, genlegend), 
+                        layout_matrix=layout, widths=c(1,4,4,2), heights=c(1,4,5))
+```
+
+## Plot Of Alternative Quantification Methods Associations with V~T~
+
+```{r alt_methods, warning=F, message=F, fig.width=8, fig.height=10}
+# MA1
+Vta <- longplotdat$outplot[[which(longplotdat$Measure=='Vt_ma1_FC')]] + 
+  labs(x=expression(paste('2TCM Frontal Cortex ',V[T])),
+       y=expression(paste('MA1 Frontal Cortex ',V[T]))) +
+  theme(axis.title.x=element_blank()) +
+  scale_y_continuous(breaks=seq(1,8,by=0.5)) +
+  geom_abline(slope = 1, linetype='dashed')
+  
+Vtb <- longplotdat$outplot[[which(longplotdat$Measure=='SUV_4060_FC')]] + 
+  labs(x=expression(paste('2TCM Frontal Cortex ',V[T])),
+       y=expression(paste('Frontal Cortex ',SUVV[40-60]))) +
+  scale_y_continuous(breaks=seq(0.5,1.6,by=0.1))
+
+# Text
+alabel <- textGrob(label = expression(paste('MA1 FC ',V[T])))
+blabel <- textGrob(label = expression(paste('FC ',SUV[40-60])))
+
+layout2 <- rbind(c(3, 1, 5),
+                 c(4, 2, 5))
+
+grid.arrange(grobs=list(Vta, Vtb, alabel, blabel, genlegend), 
+             layout_matrix=layout2, widths=c(2,4,2), heights=c(4,5))
+```
+
+```{r alt_methods_plot, fig.height=10, fig.width=6}
+longdat <- longdat %>%
+  inner_join(select(demog, PET, Genotype))
+
+# SUV
+SUV_genotype <- ggplot(plotdat, aes(x=Vt_2tcm_FC, y=SUV_4060_FC, colour=Genotype)) + 
+  geom_point() + theme_blog() + 
+  geom_line(aes(group=Subjname), linetype="dotted") +
+  labs(x=expression(paste('2TCM ',V[T])),
+       y=expression(paste('',SUV[40-60])),
+       title='Frontal Cortex',
+       subtitle='Coloured by Genotype') +
+  theme(plot.background = element_rect(fill = "white")) +
+  scale_y_continuous(breaks=seq(0.5,1.6,by=0.1)) +
+  scale_color_brewer(palette = 'Set1') + geom_smooth(method="lm", se=F) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+SUV_subject <- longdat %>% 
+  filter(PET != 'uqis_2') %>%
+  ggplot(aes(x=Vt_2tcm, y=SUV_4060, colour=Subjname, shape=Genotype, linetype=Genotype)) + 
+  geom_point() + theme_blog() + 
+  labs(x=expression(paste('2TCM ',V[T])),
+       y=expression(paste('',SUV[40-60])),
+       title='All Regions',
+       subtitle='Coloured by Participant') +
+  theme(plot.background = element_rect(fill = "white")) +
+  geom_smooth(method="lm", se=F) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+
+subjleg <-  g_legend( SUV_subject + 
+                        theme_bw() +  
+                        scale_colour_discrete(guide = FALSE) + 
+                        geom_smooth(colour="black", fill=NA) )
+
+grid.arrange(grobs=list(SUV_genotype, genlegend, SUV_subject, subjleg), ncol=2, heights=c(12,12), widths=c(6,1))
+```
+
+
+
+
+# Interregional Correlation
+
+Here the interregional correlations for V~T~ and for SUV are assessed
+
+```{r corrplots}
+VT_2tcm <- longdat %>%
+  select(PET, Genotype, Region, Vt_2tcm) %>%
+  spread(Region, Vt_2tcm)
+
+SUV_4060 <- longdat %>%
+  select(PET, Genotype, Region, SUV_4060) %>%
+  spread(Region, SUV_4060)
+
+col2 <- colorRampPalette(rev(c("#67001F", "#B2182B", "#D6604D", "#F4A582", "#FDDBC7",
+                           "#FFFFFF", "#D1E5F0", "#92C5DE", "#4393C3", "#2166AC", "#053061")))
+
+par(mfrow=c(2,2))
+VT_2tcm %>%
+  filter(Genotype=='HAB') %>%
+  select(CBL:WB) %>%
+  cor() %>%
+  corrplot.mixed(lower='ellipse', upper='number', 
+                 col=col2(200), diag='n',
+                 number.digits = 2, title=expression(HAB ~ V[T] ~ Correlations),
+                 mar=c(0,0,1,0))
+
+VT_2tcm %>%
+  filter(Genotype=='MAB') %>%
+  select(CBL:WB) %>%
+  cor() %>%
+  corrplot.mixed(lower='ellipse', upper='number', 
+                 col=col2(200), diag='n',
+                 number.digits = 2, , title=expression(MAB ~ V[T] ~ Correlations),
+                 mar=c(0,0,1,0))
+
+SUV_4060 %>%
+  filter(Genotype=='HAB') %>%
+  select(CBL:WB) %>%
+  cor() %>%
+  corrplot.mixed(lower='ellipse', upper='number', 
+                 col=col2(200), diag='n',
+                 number.digits = 2, title=expression(HAB ~ SUV ~ Correlations),
+                 mar=c(0,0,1,0))
+
+SUV_4060 %>%
+  filter(Genotype=='MAB') %>%
+  select(CBL:WB) %>%
+  cor() %>%
+  corrplot.mixed(lower='ellipse', upper='number', 
+                 col=col2(200), diag='n',
+                 number.digits = 2, title=expression(MAB ~ SUV ~ Correlations),
+                 mar=c(0,0,1,0))
+```
+
+
+#### Erratum Note:
+
+Please note that there are some small discrepancies between figure 1 in the paper and the figure above, because an older version of figure 1 was accidentally submitted for publication.  The submitted figure is an older version of the same figure produced using a previous version of *kinfitr* with a slightly different interpolation routine. This occurred at the only non-reproducible step of this analysis, namely an over-complicated email chain. We are in the process of transitioning to a collaborative, end-to-end reproducibile analysis workflow, which will minimise the possibility of these errors in future.
+
+
+
+# Principal Components Analysis
+
+Principal components analysis (PCA) is performed to assess the cumulative explained variance.  Note that scaling (z transformation) is performed both within genotype and region. Thus HABs and MABs can be combined in the same PCA analysis.
+
+```{r pca, message=F}
+pcadat <- longdat %>%
+  inner_join(select(datdf, PET, Genotype)) %>%
+  select(PET, Subjname, PETNo, Genotype, Region, Vt_2tcm) %>%
+  group_by(Region, Genotype) %>%
+  mutate(Vt_2tcm.z = scale(Vt_2tcm)) %>%
+  ungroup() %>%
+  select(PET, Subjname, PETNo, Genotype, Region, Vt_2tcm.z) %>%
+  filter(PET != 'uqis_2')
+```
+
+
+## PCA: All Regions
+
+```{r pca_all, results="asis"}
+pca1 <- pcadat %>%
+  filter(PETNo==1) %>%
+  spread(Region, Vt_2tcm.z) %>%
+  select(CBL:WB) %>%
+  prcomp() %>%
+  summary()
+
+pandoc.table(pca1$importance, digits=3, caption = "PCA for PET1: All Regions")
+
+pca2 <- pcadat %>%
+  filter(PETNo==2) %>%
+  spread(Region, Vt_2tcm.z) %>%
+  select(CBL:WB) %>%
+  prcomp() %>%
+  summary()
+
+pandoc.table(pca2$importance, digits=3, caption = "PCA for PET2: All Regions", split.tables=Inf)
+
+```
+
+
+
+## PCA: Only FC, WB and CBL
+
+This analysis is included to assess the PCA for only the target and the two reference regions in case the former analysis explained much of the total variability due to there being many target ROIs.
+
+```{r pca_main3, results="asis"}
+pca1 <- pcadat %>%
+  filter(PETNo==1) %>%
+  spread(Region, Vt_2tcm.z) %>%
+  select(FC, CBL, WB) %>%
+  prcomp() %>%
+  summary()
+
+pandoc.table(pca1$importance, digits=3, caption = "PCA for PET1: FC, WB and CBL")
+
+pca2 <- pcadat %>%
+  filter(PETNo==2) %>%
+  spread(Region, Vt_2tcm.z) %>%
+  select(FC, CBL, WB) %>%
+  prcomp() %>%
+  summary()
+
+pandoc.table(pca2$importance, digits=3, caption = "PCA for PET2: FC, WB and CBL")
+```
+
+
+
+
+# Plotting of 2TCM Model Fits
+
+## Included Participants
+
+```{r plot_2tmcfit, fig.height=6, fig.width=8}
+longdat_showFits <- longdat %>%
+  filter(Region %in% c('FC', 'WB', 'CBL'))
+
+delayFits = map(longdat_showFits$WB_delay[longdat_showFits$Region=='WB'], 
+                ~plot_inptac_fit(.x) + ggtitle('Delay'))
+
+allFits_2tcm = map2(longdat_showFits$fit_2tcm, longdat_showFits$Region, 
+                    ~plot_kinfit(.x, roiname=.y))
+
+PETs <- unique(longdat_showFits$PET)
+
+delayFits <- data.frame(PET = PETs) %>%
+  mutate(Fit = delayFits,
+         Plot = 'Delay')
+
+allFits <- data.frame(PET = rep(PETs, each=3)) %>%
+  mutate(Fit = allFits_2tcm,
+         Plot = 'Fit',
+         PET = as.character(PET)) %>%
+  bind_rows(delayFits) %>%
+  arrange(PET, Plot)
+
+allFits_excluded <- allFits %>%
+  filter(grepl(PET, pattern='uqis_2'))
+
+allFits <- allFits %>%
+  filter(!grepl(PET, pattern='uqis_2'))
+
+fitLabels <- unique(allFits$PET)
+marrangeGrob(allFits$Fit, nrow=2, ncol=2, top=quote(paste('PET: ', PETs[g])))
+```
+
+
+## Excluded Measurement
+
+```{r plot_2tcmfit_excl}
+fitLabels_excl <- unique(allFits_excluded$PET)
+marrangeGrob(allFits_excluded$Fit, nrow=2, ncol=2, top=quote(paste('PET: ', fitLabels_excl[g])))
+```
+
+
+
+
+
+# vB Checking
+
+```{r vB_check}
+longdat %>%
+  inner_join(demog) %>%
+  mutate(PET_same_day = as.factor(PET_same_day)) %>%
+  mutate(vB_fitted = map_dbl(fit_2tcm, c('par', 'vB'))) %>%
+  ggplot(aes(y=vB_fitted, x=PETNo, group=Subjname, colour=PET_same_day)) +
+  geom_point() + geom_line() +
+  theme_bw() +
+  labs(y='vB Fitted')
+```
+
+
+```{r vB_summary, results='asis'}
+vB_summary <- longdat %>%
+  inner_join(demog) %>%
+  filter(Region=='WB') %>%
+  mutate(vB_fitted = map_dbl(fit_2tcm, c('par', 'vB'))) %>%
+  group_by(Genotype) %>%
+  summarise(vB_mean = mean(vB_fitted),
+            vB_sd = sd(vB_fitted),
+            vB_min = min(vB_fitted),
+            vB_max = max(vB_fitted))
+
+pandoc.table(vB_summary, digits=2, 
+             caption='Fitted vB values for HABs and MABs')
+```
+
+
+# Session Info
+
+```{r sessionInfo}
+sessionInfo()
+```
+
